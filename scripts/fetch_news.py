@@ -20,9 +20,9 @@ PORTFOLIO_PATH = "portfolio.csv"
 HEADERS = ["ticker", "title", "source", "link", "published_date", "fetched_at"]
 
 REQUEST_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; PortfolioNewsBot/1.0)"}
-REQUEST_TIMEOUT = 10  # seconds
+REQUEST_TIMEOUT = 8  # seconds
 PER_SOURCE_ENTRY_LIMIT = 15
-DELAY_BETWEEN_REQUESTS = 1.5  # seconds, politeness between feed fetches
+DELAY_BETWEEN_REQUESTS = 0.5  # seconds, politeness between feed fetches
 MAX_ARTICLE_AGE_HOURS = 24  # discard anything older - feeds' own "recency" query hints aren't hard filters
 
 
@@ -31,26 +31,26 @@ def google_news_url(ticker, company_name):
     return f"https://news.google.com/rss/search?q={quote_plus(query)}&hl=en-US&gl=US&ceid=US:en"
 
 
+def bing_news_url(ticker, company_name):
+    query = f'"{ticker}" stock'
+    return f"https://www.bing.com/news/search?q={quote_plus(query)}&format=rss"
+
+
 def yahoo_finance_url(ticker, company_name):
     return f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={ticker}&region=US&lang=en-US"
 
 
-def nasdaq_url(ticker, company_name):
-    return f"https://www.nasdaq.com/feed/rssoutbound?symbol={ticker}"
-
-
-def seeking_alpha_url(ticker, company_name):
-    return f"https://seekingalpha.com/api/sa/combined/{ticker}.xml"
-
-
-# Google News RSS aggregates hundreds of outlets on its own; the other three
-# are best-effort bonus sources and may fail intermittently (that's fine —
-# every fetch below is isolated so one bad source never kills the run).
+# Google News and Bing News are both broad search-based aggregators covering
+# hundreds of outlets each (and largely different indexes from one another),
+# so together they're the reliable backbone. Yahoo Finance is a bonus direct
+# feed for US tickers. Nasdaq and Seeking Alpha were tried and dropped: in
+# production runs Nasdaq timed out on every single request and Seeking Alpha
+# 404'd on every single request - pure wasted time with hourly runs on a
+# free minutes budget, and zero results either way.
 SOURCES = {
     "Google News": google_news_url,
+    "Bing News": bing_news_url,
     "Yahoo Finance": yahoo_finance_url,
-    "Nasdaq": nasdaq_url,
-    "Seeking Alpha": seeking_alpha_url,
 }
 
 
