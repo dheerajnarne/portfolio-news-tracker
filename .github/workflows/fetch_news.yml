@@ -1,0 +1,34 @@
+name: Fetch Portfolio News
+
+on:
+  schedule:
+    - cron: "0 12 * * *"  # daily at 12:00 UTC
+  workflow_dispatch: {}
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Write service account credentials
+        run: echo "$GCP_SERVICE_ACCOUNT_JSON" > "$RUNNER_TEMP/service_account.json"
+        env:
+          GCP_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
+
+      - name: Run news fetcher
+        env:
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_FILE: ${{ runner.temp }}/service_account.json
+        run: python scripts/fetch_news.py
+
+      - name: Clean up credentials file
+        if: always()
+        run: rm -f "$RUNNER_TEMP/service_account.json"
