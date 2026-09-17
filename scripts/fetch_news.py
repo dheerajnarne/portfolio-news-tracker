@@ -28,8 +28,6 @@ PER_SOURCE_ENTRY_LIMIT = 15
 DELAY_BETWEEN_REQUESTS = 0.5  # seconds, politeness between feed fetches
 MAX_ARTICLE_AGE_HOURS = 24  # discard anything older - feeds' own "recency" query hints aren't hard filters
 
-IST = timezone(timedelta(hours=5, minutes=30))
-
 # --- Keyword/event alert tagging -------------------------------------------
 
 RED_KEYWORDS = [
@@ -109,10 +107,11 @@ def yahoo_finance_url(ticker, company_name):
 # Google News and Bing News are both broad search-based aggregators covering
 # hundreds of outlets each (and largely different indexes from one another),
 # so together they're the reliable backbone. Yahoo Finance is a bonus direct
-# feed for US tickers. Nasdaq and Seeking Alpha were tried and dropped: in
-# production runs Nasdaq timed out on every single request and Seeking Alpha
-# 404'd on every single request - pure wasted time with hourly runs on a
-# free minutes budget, and zero results either way.
+# feed for US tickers. Nasdaq, Seeking Alpha, and NSE Announcements were all
+# tried and dropped: Nasdaq timed out on every request, Seeking Alpha 404'd
+# on every request, and NSE's API got blocked when called from GitHub
+# Actions runners - pure wasted time with hourly runs on a free minutes
+# budget, and zero results either way.
 SOURCES = {
     "Google News": google_news_url,
     "Bing News": bing_news_url,
@@ -142,54 +141,6 @@ def entry_published_at(entry):
     if not struct:
         return None
     return datetime.fromtimestamp(calendar.timegm(struct), tz=timezone.utc)
-
-
-# --- NSE corporate announcements (mainly useful for NSE-listed tickers) -----
-
-NSE_HOME_URL = "https://www.nseindia.com/"
-NSE_ANNOUNCEMENTS_URL = "https://www.nseindia.com/api/corporate-announcements?index=equities&symbol={ticker}"
-NSE_REQUEST_HEADERS = {
-    "User-Agent": REQUEST_HEADERS["User-Agent"],
-    "Accept": "application/json, text/plain, */*",
-    "Referer": "https://www.nseindia.com/companies-listing/corporate-filings-announcements",
-}
-
-
-def make_nse_session():
-    session = requests.Session()
-    session.headers.update({"User-Agent": REQUEST_HEADERS["User-Agent"], "Accept-Language": "en-US,en;q=0.9"})
-    try:
-        session.get(NSE_HOME_URL, timeout=REQUEST_TIMEOUT)
-    except requests.RequestException as exc:
-        print(f"[warn] NSE Announcements: could not establish session ({exc})", file=sys.stderr)
-    return session
-
-
-def fetch_nse_announcements(session, ticker):
-    url = NSE_ANNOUNCEMENTS_URL.format(ticker=ticker)
-    try:
-        resp = session.get(url, headers=NSE_REQUEST_HEADERS, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        items = resp.json()
-    except (requests.RequestException, ValueError) as exc:
-        print(f"[warn] NSE Announcements: fetch failed for {ticker} ({exc})", file=sys.stderr)
-        return []
-
-    results = []
-    for item in items[:PER_SOURCE_ENTRY_LIMIT]:
-        link = (item.get("attchmntFile") or "").strip()
-        if not link:
-            continue
-        title = item.get("desc") or item.get("attchmntText") or "Corporate announcement"
-        an_dt_raw = item.get("an_dt") or ""
-        published_at = None
-        try:
-            naive = datetime.strptime(an_dt_raw, "%d-%b-%Y %H:%M:%S")
-            published_at = naive.replace(tzinfo=IST).astimezone(timezone.utc)
-        except ValueError:
-            pass
-        results.append({"link": link, "title": title, "published_at": published_at, "published_str": an_dt_raw})
-    return results
 
 
 # --- Shared row-building / sheet helpers -------------------------------------
@@ -288,8 +239,6 @@ def main():
     except WorksheetNotFound:
         pass
 
-    nse_session = make_nse_session()
-
     candidates = []  # rows without priority/matched_terms/volume_spike yet
     for ticker, company_name in stocks:
         for source_name, url_builder in SOURCES.items():
@@ -319,28 +268,6 @@ def main():
                 candidates.append(row)
 
             time.sleep(DELAY_BETWEEN_REQUESTS)
-
-        try:
-            nse_items = fetch_nse_announcements(nse_session, ticker)
-        except Exception as exc:  # noqa: BLE001 - one bad source must never kill the run
-            print(f"[warn] NSE Announcements failed for {ticker}: {exc}", file=sys.stderr)
-            nse_items = []
-
-        fetched_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        for item in nse_items:
-            result = make_row(
-                ticker, "NSE Announcements", item["link"], item["title"],
-                item["published_at"], item["published_str"], fetched_at, cutoff,
-            )
-            if not result:
-                continue
-            row, link = result
-            if link in seen_links:
-                continue
-            seen_links.add(link)
-            candidates.append(row)
-
-        time.sleep(DELAY_BETWEEN_REQUESTS)
 
     if not candidates:
         print("No new articles found.")

@@ -29,6 +29,3 @@ setup is needed for portfolio changes.
 - **volume_spike**: flags a ticker when this run's article count is 3x+ its
   average hourly count so far today (needs at least 2 prior runs today and
   3+ articles this run to avoid noise on thin data).
-- Sources now also include **NSE Announcements** — official exchange filings
-  (results, insider trades, credit rating actions) for NSE-listed holdings,
-  pulled directly from nseindia.com's public API.
