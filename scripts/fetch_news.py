@@ -17,13 +17,79 @@ import requests
 from gspread.exceptions import WorksheetNotFound
 
 PORTFOLIO_PATH = "portfolio.csv"
-HEADERS = ["ticker", "title", "source", "link", "published_date", "fetched_at"]
+HEADERS = [
+    "ticker", "title", "source", "link", "published_date", "fetched_at",
+    "priority", "matched_terms", "volume_spike",
+]
 
 REQUEST_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; PortfolioNewsBot/1.0)"}
 REQUEST_TIMEOUT = 8  # seconds
 PER_SOURCE_ENTRY_LIMIT = 15
 DELAY_BETWEEN_REQUESTS = 0.5  # seconds, politeness between feed fetches
 MAX_ARTICLE_AGE_HOURS = 24  # discard anything older - feeds' own "recency" query hints aren't hard filters
+
+IST = timezone(timedelta(hours=5, minutes=30))
+
+# --- Keyword/event alert tagging -------------------------------------------
+
+RED_KEYWORDS = [
+    "downgrade", "downgrades", "downgraded", "fraud", "scam",
+    "resignation", "resigns", "resigned", "steps down",
+    "bankruptcy", "insolvency", "insolvent",
+    "sebi probe", "sebi investigation", "regulatory probe",
+    "lawsuit", "sued", "investigation", "probe", "raid",
+    "penalty", "fined", "fine imposed", "ban", "banned",
+    "delisting", "delisted", "default", "defaults",
+    "layoffs", "layoff", "job cuts", "net loss", "loss widens",
+    "profit warning", "credit rating cut", "rating downgrade",
+]
+
+GREEN_KEYWORDS = [
+    "buyback", "share buyback", "results beat", "beats estimates",
+    "beat estimates", "upgrade", "upgrades", "upgraded", "bonus issue",
+    "record profit", "profit jumps", "profit surges", "profit soars",
+    "strong quarter", "outperform", "target price raised",
+    "price target raised", "order win", "wins order", "bags order",
+    "stake buy", "dividend declared", "special dividend",
+    "credit rating upgrade",
+]
+
+EVENT_KEYWORDS = [
+    "merger", "merges", "acquisition", "acquires", "acquire", "to acquire",
+    "stake sale", "stake purchase", "ipo", "stock split", "demerger",
+    "joint venture",
+]
+
+
+def classify_headline(title):
+    lowered = title.lower()
+    for label, keywords in (("RED", RED_KEYWORDS), ("GREEN", GREEN_KEYWORDS), ("EVENT", EVENT_KEYWORDS)):
+        matched = [kw for kw in keywords if kw in lowered]
+        if matched:
+            return label, ", ".join(matched)
+    return "", ""
+
+
+# --- Volume-spike detection --------------------------------------------------
+
+SPIKE_MULTIPLIER = 3
+SPIKE_MIN_COUNT = 3  # this run must have at least this many articles for a ticker before a spike is meaningful
+SPIKE_MIN_HISTORY_HOURS = 2  # need at least this many prior hourly runs today to trust the baseline
+
+
+def detect_spike(current_count, baseline_total, prior_hours):
+    if current_count < SPIKE_MIN_COUNT or prior_hours < SPIKE_MIN_HISTORY_HOURS:
+        return ""
+    baseline_avg = baseline_total / prior_hours
+    if baseline_avg == 0:
+        return f"SPIKE (new surge, {current_count} articles)"
+    ratio = current_count / baseline_avg
+    if ratio >= SPIKE_MULTIPLIER:
+        return f"SPIKE ({ratio:.1f}x normal)"
+    return ""
+
+
+# --- RSS sources (Google News, Bing News, Yahoo Finance) --------------------
 
 
 def google_news_url(ticker, company_name):
@@ -54,18 +120,6 @@ SOURCES = {
 }
 
 
-def read_portfolio(path):
-    with open(path, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        stocks = []
-        for row in reader:
-            ticker = (row.get("ticker") or "").strip().upper()
-            if not ticker:
-                continue
-            stocks.append((ticker, (row.get("company_name") or "").strip()))
-        return stocks
-
-
 def fetch_feed(source_name, url):
     try:
         resp = requests.get(url, headers=REQUEST_HEADERS, timeout=REQUEST_TIMEOUT)
@@ -90,18 +144,77 @@ def entry_published_at(entry):
     return datetime.fromtimestamp(calendar.timegm(struct), tz=timezone.utc)
 
 
-def entry_to_row(ticker, source_name, entry, fetched_at, cutoff):
-    link = getattr(entry, "link", "").strip()
+# --- NSE corporate announcements (mainly useful for NSE-listed tickers) -----
+
+NSE_HOME_URL = "https://www.nseindia.com/"
+NSE_ANNOUNCEMENTS_URL = "https://www.nseindia.com/api/corporate-announcements?index=equities&symbol={ticker}"
+NSE_REQUEST_HEADERS = {
+    "User-Agent": REQUEST_HEADERS["User-Agent"],
+    "Accept": "application/json, text/plain, */*",
+    "Referer": "https://www.nseindia.com/companies-listing/corporate-filings-announcements",
+}
+
+
+def make_nse_session():
+    session = requests.Session()
+    session.headers.update({"User-Agent": REQUEST_HEADERS["User-Agent"], "Accept-Language": "en-US,en;q=0.9"})
+    try:
+        session.get(NSE_HOME_URL, timeout=REQUEST_TIMEOUT)
+    except requests.RequestException as exc:
+        print(f"[warn] NSE Announcements: could not establish session ({exc})", file=sys.stderr)
+    return session
+
+
+def fetch_nse_announcements(session, ticker):
+    url = NSE_ANNOUNCEMENTS_URL.format(ticker=ticker)
+    try:
+        resp = session.get(url, headers=NSE_REQUEST_HEADERS, timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        items = resp.json()
+    except (requests.RequestException, ValueError) as exc:
+        print(f"[warn] NSE Announcements: fetch failed for {ticker} ({exc})", file=sys.stderr)
+        return []
+
+    results = []
+    for item in items[:PER_SOURCE_ENTRY_LIMIT]:
+        link = (item.get("attchmntFile") or "").strip()
+        if not link:
+            continue
+        title = item.get("desc") or item.get("attchmntText") or "Corporate announcement"
+        an_dt_raw = item.get("an_dt") or ""
+        published_at = None
+        try:
+            naive = datetime.strptime(an_dt_raw, "%d-%b-%Y %H:%M:%S")
+            published_at = naive.replace(tzinfo=IST).astimezone(timezone.utc)
+        except ValueError:
+            pass
+        results.append({"link": link, "title": title, "published_at": published_at, "published_str": an_dt_raw})
+    return results
+
+
+# --- Shared row-building / sheet helpers -------------------------------------
+
+
+def read_portfolio(path):
+    with open(path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        stocks = []
+        for row in reader:
+            ticker = (row.get("ticker") or "").strip().upper()
+            if not ticker:
+                continue
+            stocks.append((ticker, (row.get("company_name") or "").strip()))
+        return stocks
+
+
+def make_row(ticker, source_name, link, title, published_at, published_str, fetched_at, cutoff):
+    link = (link or "").strip()
     if not link:
         return None
-
-    published_at = entry_published_at(entry)
     if published_at is None or published_at < cutoff:
         return None  # too old, or undated and unverifiable - skip to keep the sheet fresh
-
-    title = getattr(entry, "title", "").strip()
-    published = getattr(entry, "published", "") or getattr(entry, "updated", "")
-    return [ticker, title, source_name, link, published, fetched_at], link
+    title = (title or "").strip()
+    return [ticker, title, source_name, link, published_str, fetched_at], link
 
 
 def get_spreadsheet():
@@ -113,22 +226,40 @@ def get_spreadsheet():
 
 def get_or_create_daily_worksheet(sh, date_str):
     try:
-        return sh.worksheet(date_str)
+        ws = sh.worksheet(date_str)
+        if ws.row_values(1) != HEADERS:
+            ws.update(range_name="A1", values=[HEADERS])
+        return ws
     except WorksheetNotFound:
         ws = sh.add_worksheet(title=date_str, rows=1000, cols=len(HEADERS))
         ws.append_row(HEADERS)
         return ws
 
 
-def links_in_worksheet(worksheet):
+def read_worksheet_stats(worksheet):
+    """Links, per-ticker row counts, and distinct fetched_at hour-buckets in a worksheet."""
     values = worksheet.get_all_values()
     if not values:
-        return set()
+        return set(), {}, set()
+
     header = values[0]
-    if "link" not in header:
-        return set()
-    link_idx = header.index("link")
-    return {row[link_idx].strip() for row in values[1:] if len(row) > link_idx and row[link_idx]}
+    link_idx = header.index("link") if "link" in header else None
+    ticker_idx = header.index("ticker") if "ticker" in header else None
+    fetched_idx = header.index("fetched_at") if "fetched_at" in header else None
+
+    links = set()
+    ticker_counts = {}
+    hour_buckets = set()
+    for row in values[1:]:
+        if link_idx is not None and len(row) > link_idx and row[link_idx]:
+            links.add(row[link_idx].strip())
+        if ticker_idx is not None and len(row) > ticker_idx and row[ticker_idx]:
+            t = row[ticker_idx].strip()
+            ticker_counts[t] = ticker_counts.get(t, 0) + 1
+        if fetched_idx is not None and len(row) > fetched_idx and row[fetched_idx]:
+            hour_buckets.add(row[fetched_idx][:13])  # "YYYY-MM-DDTHH"
+
+    return links, ticker_counts, hour_buckets
 
 
 def main():
@@ -145,15 +276,21 @@ def main():
     sh = get_spreadsheet()
     today_ws = get_or_create_daily_worksheet(sh, today_str)
 
+    today_links, today_ticker_counts, today_hour_buckets = read_worksheet_stats(today_ws)
+    prior_hours = len(today_hour_buckets)
+
     # Nothing older than MAX_ARTICLE_AGE_HOURS is ever added, so checking
     # today's + yesterday's tab is enough to dedup across the day boundary.
-    seen_links = links_in_worksheet(today_ws)
+    seen_links = set(today_links)
     try:
-        seen_links |= links_in_worksheet(sh.worksheet(yesterday_str))
+        yesterday_links, _, _ = read_worksheet_stats(sh.worksheet(yesterday_str))
+        seen_links |= yesterday_links
     except WorksheetNotFound:
         pass
 
-    new_rows = []
+    nse_session = make_nse_session()
+
+    candidates = []  # rows without priority/matched_terms/volume_spike yet
     for ticker, company_name in stocks:
         for source_name, url_builder in SOURCES.items():
             url = url_builder(ticker, company_name)
@@ -165,22 +302,70 @@ def main():
 
             fetched_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
             for entry in entries:
-                result = entry_to_row(ticker, source_name, entry, fetched_at, cutoff)
+                result = make_row(
+                    ticker, source_name,
+                    getattr(entry, "link", ""),
+                    getattr(entry, "title", ""),
+                    entry_published_at(entry),
+                    getattr(entry, "published", "") or getattr(entry, "updated", ""),
+                    fetched_at, cutoff,
+                )
                 if not result:
                     continue
                 row, link = result
                 if link in seen_links:
                     continue
                 seen_links.add(link)
-                new_rows.append(row)
+                candidates.append(row)
 
             time.sleep(DELAY_BETWEEN_REQUESTS)
 
-    if new_rows:
-        today_ws.append_rows(new_rows, value_input_option="RAW")
-        print(f"Appended {len(new_rows)} new rows to '{today_str}'.")
-    else:
+        try:
+            nse_items = fetch_nse_announcements(nse_session, ticker)
+        except Exception as exc:  # noqa: BLE001 - one bad source must never kill the run
+            print(f"[warn] NSE Announcements failed for {ticker}: {exc}", file=sys.stderr)
+            nse_items = []
+
+        fetched_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        for item in nse_items:
+            result = make_row(
+                ticker, "NSE Announcements", item["link"], item["title"],
+                item["published_at"], item["published_str"], fetched_at, cutoff,
+            )
+            if not result:
+                continue
+            row, link = result
+            if link in seen_links:
+                continue
+            seen_links.add(link)
+            candidates.append(row)
+
+        time.sleep(DELAY_BETWEEN_REQUESTS)
+
+    if not candidates:
         print("No new articles found.")
+        return
+
+    current_counts = {}
+    for row in candidates:
+        current_counts[row[0]] = current_counts.get(row[0], 0) + 1
+
+    spike_labels = {
+        ticker: detect_spike(count, today_ticker_counts.get(ticker, 0), prior_hours)
+        for ticker, count in current_counts.items()
+    }
+
+    new_rows = []
+    for row in candidates:
+        ticker, title = row[0], row[1]
+        priority, matched_terms = classify_headline(title)
+        new_rows.append(row + [priority, matched_terms, spike_labels.get(ticker, "")])
+
+    today_ws.append_rows(new_rows, value_input_option="RAW")
+    print(f"Appended {len(new_rows)} new rows to '{today_str}'.")
+    for ticker, label in spike_labels.items():
+        if label:
+            print(f"[spike] {ticker}: {label}")
 
 
 if __name__ == "__main__":
