@@ -1,7 +1,7 @@
 # Portfolio News Aggregator
 
-Runs daily (free, via GitHub Actions) and appends new news article links for
-every stock in `portfolio.csv` into a Google Sheet.
+Runs hourly (free, via GitHub Actions) and appends new news article links for
+every stock in `portfolio.csv` into a dated tab of a Google Sheet.
 
 ## How it works
 
@@ -11,10 +11,15 @@ every stock in `portfolio.csv` into a Google Sheet.
   Bloomberg, MarketWatch, Motley Fool, Benzinga, Seeking Alpha, Investing.com,
   etc.) plus three direct feeds (Yahoo Finance, Nasdaq, Seeking Alpha) as
   bonus redundancy.
-- New links (not already in the sheet) are appended as rows:
+- Only articles published within the last 24 hours are kept — a feed's own
+  "recent" query hint (e.g. Google's `when:2d`) is just a ranking bias, not a
+  hard filter, so the script checks each entry's real publish date itself.
+- The sheet gets one new tab per day, named `YYYY-MM-DD` (UTC), created
+  automatically the first time news lands on that day.
+- New links (not already in today's or yesterday's tab) are appended as rows:
   `ticker, title, source, link, published_date, fetched_at`.
-- `.github/workflows/fetch_news.yml` runs the script once a day (12:00 UTC)
-  and can also be triggered manually from the Actions tab.
+- `.github/workflows/fetch_news.yml` runs the script once an hour, on the
+  hour (UTC), and can also be triggered manually from the Actions tab.
 
 ## Adding to your portfolio
 
@@ -76,5 +81,10 @@ python scripts/fetch_news.py
   canonical link — so the same article reached via Google News vs. a direct
   feed can appear as two separate rows. Dedup is by exact link, not by
   underlying article.
-- The sheet will grow indefinitely over time; there's no automatic
-  archiving/trimming in this version.
+- The spreadsheet gains one new tab per day indefinitely; there's no
+  automatic archiving/trimming of old daily tabs in this version.
+- Hourly runs use roughly 1,400–1,500 GitHub Actions minutes/month (24 runs
+  a day × ~2 min each), comfortably under the 2,000 free minutes/month for
+  private repos — but there's little headroom if the run gets slower, so
+  keep an eye on **Settings → Billing → Actions usage** if you add many more
+  tickers or sources.
