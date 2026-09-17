@@ -2,7 +2,8 @@
 
 Runs hourly (free, via GitHub Actions) and appends new news article links for
 every stock in `portfolio.csv` into a dated tab of a Google Sheet.
-
+## Google Sheets Link:
+https://docs.google.com/spreadsheets/d/1rjj6S28Kfo6TstTkD7GTDvfi5JFWHvVjbALqhOUS_iA/edit?gid=0#gid=0
 ## How it works
 
 - `portfolio.csv` is your portfolio — one row per stock.
